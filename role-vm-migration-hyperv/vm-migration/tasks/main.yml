@@ -1,0 +1,276 @@
+---
+- name: Check if VM exists on Hyper-V host
+  win_shell: |
+        $vm = Get-VM -Name "{{ vmname }}" -ErrorAction SilentlyContinue
+        if (-not $vm) { exit 1 }
+  register: vm_check
+  failed_when: vm_check.rc != 0
+  changed_when: false
+
+- name: Fail if checkpoints exist for VM
+  win_shell: |
+    $checkpoints = Get-VMSnapshot -VMName "{{ vmname }}" -ErrorAction SilentlyContinue
+    if ($checkpoints) {
+      Write-Error "VM {{ vmname }} has checkpoints. Please delete them before proceeding."
+      exit 1
+    }
+  register: checkpoint_check
+  failed_when: checkpoint_check.rc != 0
+  changed_when: false
+
+- name: Login into Openshift Cluster
+  win_shell: |
+    oc login --username="{{ ocp_username }}" --password="{{ ocp_password }}" --server="{{ ocp_api_url }}" --insecure-skip-tls-verify=true
+    oc get nodes
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+  no_log: true
+
+- name: Get node list
+  win_shell: |
+    oc get nodes
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+  register: nodeout
+
+- name: Set exportdir variable
+  set_fact:
+    exportdir: "{{ export_dir }}\\{{ vmname }}"
+
+- name: Create export directory
+  win_file:
+    path: "{{ exportdir }}"
+    state: directory
+
+- name: Show Node Info
+  debug:
+    var: nodeout.stdout_lines  
+
+- name: Get VM CPU and Memory
+  win_shell: |
+     $vm = Get-VM -Name "{{ vmname }}"
+     Write-Output "$($vm.ProcessorCount),$($vm.MemoryStartup/1024/1024)"
+  register: vm_specs
+
+- name: Get VM disks list
+  win_shell: |
+    (Get-VMHardDiskDrive -VMName "{{ vmname }}").Path
+  register: vm_disks
+
+- name: Set disk list fact
+  set_fact:
+    disk_paths: "{{ vm_disks.stdout_lines }}"
+- name: Get VM disks Names
+  win_shell: |
+    Get-VMHardDiskDrive -VMName "{{ vmname }}" | ForEach-Object {
+    ([System.IO.Path]::GetFileNameWithoutExtension($_.Path) -replace '[^A-Za-z0-9]', '-').ToLower()
+    }
+  register: disk_names
+
+- name: Fail if no disks found
+  fail:
+    msg: "No disks found for VM {{ vmname }}"
+  when: disk_paths | length == 0
+
+- name: Get disk sizes (bytes)
+  win_shell: |
+      (Get-VHD "{{ item }}").Size
+  loop: "{{ disk_paths }}"
+  register: disk_sizes
+  changed_when: false
+
+- name: Build disk metadata list
+  set_fact:
+    disk_info_list: >-
+      {{
+        disk_paths | zip(disk_sizes.results | map(attribute='stdout')) | list
+      }}
+
+- name: Get existing PVCs in namespace
+  win_shell: |
+    oc get pvc -n {{ ocp_namespace }} -o json
+  args:
+    executable: cmd
+    chdir: C:\Software\Openshift-Tool
+  register: existing_pvcs_raw
+
+- name: Parse PVC list
+  set_fact:
+    existing_pvcs: "{{ existing_pvcs_raw.stdout | from_json | json_query('items[].metadata.name') }}"
+
+- name: Stop VM
+  win_shell: Stop-VM -Name "{{ vmname }}" -Force
+
+- name: Build sanitized disk name mapping
+  set_fact:
+    disk_map: "{{ disk_map | default({}) | combine({ item: (item | basename | splitext)[0] | lower | regex_replace('[^a-z0-9]', '_') }) }}"
+  loop: "{{ vm_disks.stdout_lines }}"
+
+- name: Parallel convert VHDX to QCOW2
+  win_shell: |
+    Set-Location -Path (Split-Path "{{ item }}")
+    $outFile = (Split-Path "{{ item }}" -Leaf).ToLower() -replace '[^a-z0-9]', '-'
+    $outFile = $outFile -replace '-vhdx$', '.qcow2'
+    C:\\Software\\Openshift-Tool\\qemu-img-win-x64-2_3_0\\qemu-img.exe convert -p -f vhdx -O qcow2 "{{ item }}" "{{ exportdir }}\\$outFile"
+  loop: "{{ vm_disks.stdout_lines }}"
+  loop_control:
+    label: "{{ item }}"
+  async: 9000
+  poll: 0
+  register: qcow2_jobs
+
+- name: Wait for QCOW2 conversions to finish
+  async_status:
+    jid: "{{ item.ansible_job_id }}"
+  register: qcow2_results
+  until: qcow2_results.finished
+  retries: 3000
+  delay: 30
+  loop: "{{ qcow2_jobs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Verify all conversions succeeded
+  fail:
+    msg: "One or more QCOW2 conversions failed."
+  when: qcow2_results is failed    
+
+# - name: Calculate SHA256 for QCOW2 files
+#   win_shell: |
+#     Get-FileHash "{{ exportdir }}\\*.qcow2" -Algorithm SHA256 | ForEach-Object {
+#     "$($_.Path) $($_.Hash)"
+#     }
+#   register: qcow2_hashes
+
+# - name: Show QCOW2 hashes
+#   debug:
+#     msg: "{{ qcow2_hashes.stdout_lines }}"
+    
+- name: Initialize pvc_info_list
+  set_fact:
+    pvc_info_list: []
+
+- name: Build PVC info list with disk size in GiB + 2
+  set_fact:
+    pvc_info_list: "{{ pvc_info_list + [ {
+      'path': item.0,
+      'size_bytes': (item.1 | int),
+      'size_gib': ((item.1 | int) / (1024 ** 3)) | round(0, 'ceil'),
+      'pvc_size': (((item.1 | int) / (1024 ** 3)) | round(0, 'ceil') + 2),
+      'pvc_name': (item.0 |  regex_replace('\\\\', '\\\\\\\\') | replace('\\\\', '/') | basename | regex_replace('\\.vhdx$', '') | lower | regex_replace('[^a-z0-9]', '-') )
+          } ] }}"
+  loop: "{{ disk_info_list }}" 
+  delegate_to: localhost 
+
+- name: Login into Openshift Cluster
+  win_shell: |
+    oc login --username="{{ ocp_username }}" --password="{{ ocp_password }}" --server="{{ ocp_api_url }}" --insecure-skip-tls-verify=true
+    oc get nodes
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+  no_log: true
+
+- name: Show pvc_info_list
+  debug:
+    msg: "{{ pvc_info_list }}"
+
+- name: Generate DataVolume manifests from template
+  template:
+    src: files/pvc.yml.j2
+    dest: "{{ exportdir }}\\dv-{{ item.pvc_name }}.yml"
+  loop: "{{ pvc_info_list }}"
+  when: item.pvc_name not in existing_pvcs
+
+- name: Apply DataVolume manifests
+  win_shell: |
+    oc apply -f "{{ exportdir }}\\dv-{{ item.pvc_name }}.yml" -n {{ ocp_namespace }}
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+  loop: "{{ pvc_info_list }}"
+  when: item.pvc_name not in existing_pvcs
+
+- name: Parallel PVC creation + QCOW2 upload
+  win_shell: |
+    $diskPath = "{{ item.path }}"
+    $diskDir = Split-Path -Parent $diskPath
+    Set-Location $diskDir
+    $fileName = (Split-Path -Leaf $diskPath).ToLower() -replace '[^a-z0-9]', '-'
+    $qcowFile = "$fileName" -replace '-vhdx$', '.qcow2'
+
+    C:\\Software\\Openshift-Tool\\virtctl image-upload pvc "{{item.pvc_name}}" --image-path="{{ exportdir }}\\$qcowFile" --namespace={{ ocp_namespace }} --access-mode=ReadWriteMany --size="{{ item.pvc_size }}Gi" --insecure --volume-mode block
+  loop: "{{ pvc_info_list }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  async: 9000
+  poll: 0
+  register: upload_jobs
+  args:
+    chdir: C:\Software\Openshift-Tool
+
+
+- name: Wait for all uploads to complete
+  async_status:
+    jid: "{{ item.ansible_job_id }}"
+  register: upload_results
+  until: 
+    - upload_results.finished
+    - "'successfully populated' in (upload_results.stderr | default('') | lower) or upload_results.finished"
+  retries: 3000
+  delay: 30
+  loop: "{{ upload_jobs.results }}"
+  loop_control:
+    label: "{{ item.item.path | basename }}"
+  failed_when: >
+    upload_results.failed is defined and upload_results.failed and
+    ('successfully populated' not in (upload_results.stderr | default('') | lower))
+  changed_when: "'successfully populated' not in (upload_results.stderr | default('') | lower)"
+  tags: wait_uploads
+
+- name: Mark skipped uploads as already populated
+  debug:
+    msg: "Upload for {{ item.item.path | basename }} skipped (already populated)."
+  when: "'successfully populated' in (item.stderr | default('') | lower)"
+  loop: "{{ upload_jobs.results }}"
+  loop_control:
+    label: "{{ item.item.path | basename }}"
+  tags: wait_uploads
+
+- name: Login into Openshift Cluster
+  win_shell: |
+    oc login --username="{{ ocp_username }}" --password="{{ ocp_password }}" --server="{{ ocp_api_url }}" --insecure-skip-tls-verify=true
+    oc get nodes
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+  no_log: true
+
+- name: Generate a VM specs with BIOS Boot mode from template
+  template:
+    src: files/vm.yml.j2
+    dest: "{{ exportdir }}\\{{vmname |lower| regex_replace('[^a-z0-9]', '-')}}-vm.yml"
+  when: biosmode == "BIOS"
+
+- name: Generate a VM specs with UEFI Boot mode from template
+  template:
+    src: files/vm1.yml.j2
+    dest: "{{ exportdir }}\\{{vmname |lower| regex_replace('[^a-z0-9]', '-')}}-vm.yml"
+  when: biosmode == "UEFI"
+
+- name: Apply VM manifest
+  win_shell: |
+    oc apply -f "{{ exportdir }}\\{{ vmname | lower | regex_replace('[^a-z0-9]', '-') }}-vm.yml"
+  register: apply_vm
+  changed_when: "'configured' in apply_vm.stdout or 'created' in apply_vm.stdout or apply_vm.rc == 0"
+  args:
+    chdir: C:\Software\Openshift-Tool
+    executable: cmd
+
+- name: Remove exportdir directory (Windows)
+  win_file:
+    path: "{{ exportdir }}"
+    state: absent    
+

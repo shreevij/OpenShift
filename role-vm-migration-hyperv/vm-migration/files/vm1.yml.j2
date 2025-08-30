@@ -1,0 +1,39 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: {{ vmname | lower | regex_replace('[^a-z0-9]', '-') }}
+  namespace: {{ ocp_namespace }}
+spec:
+  running: false
+  template:
+    metadata:
+      labels:
+        migrated-from: hyperv
+    spec:
+      domain:
+        cpu:
+          cores: {{ (vm_specs.stdout.split(','))[0] | int }}
+        resources:
+          requests:
+            memory: "{{ (vm_specs.stdout.split(','))[1] | int }}Mi"
+        devices:
+          disks:
+{% for pvc in disk_names.stdout_lines %}
+          - name: {{ pvc }}
+            disk:
+              bus: sata        
+{% endfor %}
+        features:
+          acpi: {}
+          smm:
+            enabled: true
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false 
+      volumes:
+{% for pvc in disk_names.stdout_lines %}
+      - name: {{ pvc }}
+        persistentVolumeClaim:
+          claimName: {{ pvc }}
+{% endfor %}

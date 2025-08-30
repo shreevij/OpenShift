@@ -1,0 +1,13 @@
+---
+- hosts: all
+#  connection: local
+  gather_facts: no
+#  become: true
+  vars:
+    ansible_python_interpreter: /usr/libexec/platform-python
+#    k8s_manifests_base_dir: k8s-manifests/
+#    k8s_manifests:
+#      - pvc
+
+  roles:
+    - role: vm-migration

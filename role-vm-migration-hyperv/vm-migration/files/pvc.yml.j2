@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ item.pvc_name }}
+  labels:
+    migrated-from: hyperv
+    vm-name: {{ vmname | lower }}  
+  annotations:
+    cdi.kubevirt.io/storage.upload.target: "true"   # required to enable upload
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: {{ item.pvc_size }}Gi
+  volumeMode: Block
