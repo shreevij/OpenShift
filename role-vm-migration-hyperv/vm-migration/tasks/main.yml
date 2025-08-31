@@ -218,7 +218,7 @@
   register: upload_results
   until: 
     - upload_results.finished
-    - "'successfully populated' in (upload_results.stderr | default('') | lower) or upload_results.finished"
+    - "'successfully' in (upload_results.stderr | default('') | lower) or upload_results.finished"
   retries: 3000
   delay: 30
   loop: "{{ upload_jobs.results }}"
@@ -226,14 +226,14 @@
     label: "{{ item.item.path | basename }}"
   failed_when: >
     upload_results.failed is defined and upload_results.failed and
-    ('successfully populated' not in (upload_results.stderr | default('') | lower))
-  changed_when: "'successfully populated' not in (upload_results.stderr | default('') | lower)"
+    ('successfully' not in (upload_results.stderr | default('') | lower))
+  changed_when: "'successfully' not in (upload_results.stderr | default('') | lower)"
   tags: wait_uploads
 
 - name: Mark skipped uploads as already populated
   debug:
     msg: "Upload for {{ item.item.path | basename }} skipped (already populated)."
-  when: "'successfully populated' in (item.stderr | default('') | lower)"
+  when: "'successfully' in (item.stderr | default('') | lower)"
   loop: "{{ upload_jobs.results }}"
   loop_control:
     label: "{{ item.item.path | basename }}"
