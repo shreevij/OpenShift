@@ -25,56 +25,56 @@ Script 1: Save Your Network Settings Before Migration
 
 This script finds the main network adapter, grabs all the important settings, and saves them in a simple JSON file on the VM.
 
-# Find the main active network adapter with IPv4 address
-$adapter = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
-
-if ($adapter) {
-    $config = [PSCustomObject]@{
-        InterfaceAlias = $adapter.InterfaceAlias
-        IPAddress      = $adapter.IPv4Address.IPAddress
-        PrefixLength   = $adapter.IPv4Address.PrefixLength
-        DefaultGateway = $adapter.IPv4DefaultGateway.NextHop
-        DNSServers     = ($adapter.DNSServer.ServerAddresses -join ",")
-    }
-
-    # Save configuration to JSON file
-    $config | ConvertTo-Json | Set-Content -Path "C:\scripts\NICConfig.json"
-    Write-Host "Network configuration saved to C:\scripts\NICConfig.json"
-} else {
-    Write-Host "No active network adapter found."
-}
-# Register a scheduled task to apply these settings automatically after migration (assuming task XML is ready)
-Register-ScheduledTask -TaskName "SetStaticIP" -Xml (Get-Content "c:\scripts\SetStaticIP.xml" | Out-String) -Force
+                # Find the main active network adapter with IPv4 address
+                $adapter = Get-NetIPConfiguration | Where-Object { $_.IPv4Address -and $_.NetAdapter.Status -eq 'Up' } | Select-Object -First 1
+                
+                if ($adapter) {
+                    $config = [PSCustomObject]@{
+                        InterfaceAlias = $adapter.InterfaceAlias
+                        IPAddress      = $adapter.IPv4Address.IPAddress
+                        PrefixLength   = $adapter.IPv4Address.PrefixLength
+                        DefaultGateway = $adapter.IPv4DefaultGateway.NextHop
+                        DNSServers     = ($adapter.DNSServer.ServerAddresses -join ",")
+                    }
+                
+                    # Save configuration to JSON file
+                    $config | ConvertTo-Json | Set-Content -Path "C:\scripts\NICConfig.json"
+                    Write-Host "Network configuration saved to C:\scripts\NICConfig.json"
+                } else {
+                    Write-Host "No active network adapter found."
+                }
+                # Register a scheduled task to apply these settings automatically after migration (assuming task XML is ready)
+                Register-ScheduledTask -TaskName "SetStaticIP" -Xml (Get-Content "c:\scripts\SetStaticIP.xml" | Out-String) -Force
 _____________________________________________________________________
 **Script 2: Automatically Apply Your Network Settings After Migration**
 _____________________________________________________________________
 When your VM boots in OpenShift, this script kicks in. It reads the saved settings and configures the new network interface accordingly.
 
-# Load saved network configuration
-$config = Get-Content -Raw -Path "C:\scripts\NICConfig.json" | ConvertFrom-Json
+                # Load saved network configuration
+                $config = Get-Content -Raw -Path "C:\scripts\NICConfig.json" | ConvertFrom-Json
+                
+                # Find the active network adapter
+                $nic = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+                
+                if ($nic) {
+                    # Remove existing IP and DNS settings to avoid conflicts
+                    Get-NetIPAddress -InterfaceAlias $nic.Name -AddressFamily IPv4 | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+                    Get-NetIPAddress -InterfaceAlias $nic.Name -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+                    Set-DnsClientServerAddress -InterfaceAlias $nic.Name -ResetServerAddresses
+                
+                    # Apply saved IP, subnet prefix, gateway, and DNS servers
+                    New-NetIPAddress -InterfaceAlias $nic.Name -IPAddress $config.IPAddress -PrefixLength $config.PrefixLength -DefaultGateway $config.DefaultGateway
+                    Set-DnsClientServerAddress -InterfaceAlias $nic.Name -ServerAddresses ($config.DNSServers -split ",")
+                
+                    Write-Host "Network configuration restored on $($nic.Name)"
+                } else {
+                    Write-Host "No active network adapter found."
+                }
+                
+                # Remove the scheduled task so it doesn’t run again unnecessarily
+                Unregister-ScheduledTask -TaskName SetStaticIP -Confirm:$false
 
-# Find the active network adapter
-$nic = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
-
-if ($nic) {
-    # Remove existing IP and DNS settings to avoid conflicts
-    Get-NetIPAddress -InterfaceAlias $nic.Name -AddressFamily IPv4 | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-    Get-NetIPAddress -InterfaceAlias $nic.Name -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-    Set-DnsClientServerAddress -InterfaceAlias $nic.Name -ResetServerAddresses
-
-    # Apply saved IP, subnet prefix, gateway, and DNS servers
-    New-NetIPAddress -InterfaceAlias $nic.Name -IPAddress $config.IPAddress -PrefixLength $config.PrefixLength -DefaultGateway $config.DefaultGateway
-    Set-DnsClientServerAddress -InterfaceAlias $nic.Name -ServerAddresses ($config.DNSServers -split ",")
-
-    Write-Host "Network configuration restored on $($nic.Name)"
-} else {
-    Write-Host "No active network adapter found."
-}
-
-# Remove the scheduled task so it doesn’t run again unnecessarily
-Unregister-ScheduledTask -TaskName SetStaticIP -Confirm:$false
-
-How to Set This Up
+**How to Set This Up**
 
 Create a folder on your VM, like C:\scripts, to store the scripts and config file.
 
